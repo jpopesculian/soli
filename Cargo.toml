@@ -1,0 +1,9 @@
+[package]
+name = "sol-repl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ethers = { git = "https://github.com/gakonst/ethers-rs" }
+ethers-solc = { git = "https://github.com/gakonst/ethers-rs" }
+revm = "1.7.0"
