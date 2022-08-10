@@ -6,4 +6,9 @@ edition = "2021"
 [dependencies]
 ethers = { git = "https://github.com/gakonst/ethers-rs" }
 ethers-solc = { git = "https://github.com/gakonst/ethers-rs" }
+hex = "0.4.3"
+primitive-types = "0.11.1"
 revm = "1.7.0"
+semver = "1.0.13"
+similar = "2.2.0"
+solang-parser = "0.1.17"
