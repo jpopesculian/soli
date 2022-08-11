@@ -2751,12 +2751,14 @@ dependencies = [
 name = "sol-repl"
 version = "0.1.0"
 dependencies = [
+ "ethabi",
  "ethers",
  "ethers-solc",
  "hex",
  "primitive-types",
  "revm",
  "semver",
+ "serde_json",
  "similar",
  "solang-parser",
 ]

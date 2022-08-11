@@ -1,21 +1,16 @@
-use std::{
-    collections::{hash_map, HashMap},
-    fmt::Debug,
-    io::Write,
-    path::PathBuf,
-};
+use std::{collections::HashMap, fmt::Debug, io::Write, path::PathBuf};
 
+use ethabi::{ethereum_types::U256, param_type::ParamType};
 use ethers::core::types::Bytes;
 use ethers_solc::{
     artifacts::{BytecodeObject, Contract, Source, Sources},
     Artifact, CompilerInput, Solc,
 };
-use primitive_types::U256;
 use revm::{CreateScheme, Database, InMemoryDB, Inspector, OpCode, TransactTo};
 use semver::Version;
 use solang_parser::{
     diagnostics::Diagnostic,
-    pt::{self, CodeLocation, Loc, StorageLocation},
+    pt::{self, CodeLocation, StorageLocation},
 };
 
 #[derive(Clone, Copy, Ord, PartialOrd, Eq, PartialEq, Hash)]
@@ -101,21 +96,16 @@ pub trait ArtifactExt: Artifact {
 }
 impl<T> ArtifactExt for T where T: Artifact {}
 
-#[derive(Debug)]
 struct Logger {
-    instructions: HashMap<Loc, Vec<Instruction>>,
-    stack: HashMap<Loc, Vec<Option<U256>>>,
+    last_instruction: usize,
+    state: Option<(revm::Return, revm::Stack, revm::Memory)>,
 }
 
 impl Logger {
-    fn new(instructions: HashMap<Loc, Vec<Instruction>>) -> Self {
-        let stack = instructions
-            .iter()
-            .map(|(k, v)| (*k, Vec::with_capacity(v.len())))
-            .collect();
+    fn new(last_instruction: usize) -> Self {
         Self {
-            instructions,
-            stack,
+            last_instruction,
+            state: None,
         }
     }
 }
@@ -131,13 +121,8 @@ where
         _is_static: bool,
         eval: revm::Return,
     ) -> revm::Return {
-        for (loc, instructions) in self.instructions.iter() {
-            for instruction in instructions {
-                if instruction.pc == interp.program_counter() - 1 {
-                    dbg!(instruction);
-                    dbg!(interp.stack.data());
-                }
-            }
+        if interp.program_counter() - 1 == self.last_instruction {
+            self.state = Some((eval.clone(), interp.stack.clone(), interp.memory.clone()));
         }
         eval
     }
@@ -251,7 +236,7 @@ impl<'a> ConstructedSource<'a> {
             .and_then(|parse_tree| self.decompose(parse_tree))
     }
 
-    fn compile(&mut self) -> Result<Contract, Vec<Box<dyn std::fmt::Display>>> {
+    fn compile(&self) -> Result<Contract, Vec<Box<dyn std::fmt::Display>>> {
         let mut compiled = match self.solc.compile_exact(&self.compiler_input()) {
             Ok(compiled) => compiled,
             Err(err) => return Err(vec![Box::new(err)]),
@@ -294,6 +279,28 @@ impl<'a> std::fmt::Display for ConstructedSource<'a> {
     }
 }
 
+fn parse_identifier(input: &str) -> (&str, &str) {
+    let mut iter = input.char_indices();
+    let mut end = 0;
+    if let Some((idx, ch)) = iter.next() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '$' | '_' => {
+                end = idx + 1;
+            }
+            _ => return input.split_at(end),
+        }
+    }
+    for (idx, ch) in iter {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '$' | '_' => {
+                end = idx + 1;
+            }
+            _ => return input.split_at(end),
+        }
+    }
+    input.split_at(end)
+}
+
 #[derive(Debug)]
 pub enum ParseTreeFragment {
     Source(Vec<pt::SourceUnitPart>),
@@ -329,102 +336,145 @@ pub fn parse_fragment(solc: &Solc, buffer: &str) -> Option<ParseTreeFragment> {
     None
 }
 
-#[derive(Debug)]
-struct Label {
-    pub name: String,
-    pub storage: Option<pt::StorageLocation>,
-    pub ty: Option<pt::Type>,
-    pub loc: Loc,
-    pub stack_offset: usize,
+#[derive(Debug, Clone)]
+enum Type {
+    Builtin(ParamType),
+    Array(Box<Type>),
+    FixedArray(Box<Type>, usize),
+    Map(Box<Type>, Box<Type>),
+    Custom(Vec<String>),
 }
 
-fn get_statement_labels<'a>(statements: impl IntoIterator<Item = &'a pt::Statement>) -> Vec<Label> {
-    let mut out = Vec::new();
-    for statement in statements {
-        match statement {
-            pt::Statement::Block { statements, .. } => {
-                out.append(&mut get_statement_labels(statements));
-            }
-            pt::Statement::If(_, _, if_block, else_block) => {
-                out.append(&mut get_statement_labels([if_block.as_ref()]));
-                if let Some(else_block) = else_block {
-                    out.append(&mut get_statement_labels([else_block.as_ref()]));
+impl Type {
+    fn from_expression(expr: &pt::Expression) -> Option<Self> {
+        Some(match expr {
+            pt::Expression::Type(_, ty) => match ty {
+                pt::Type::Address | pt::Type::AddressPayable | pt::Type::Payable => {
+                    Type::Builtin(ParamType::Address)
                 }
-            }
-            pt::Statement::While(_, _, block) | pt::Statement::DoWhile(_, block, _) => {
-                out.append(&mut get_statement_labels([block.as_ref()]));
-            }
-            pt::Statement::For(_, block1, _, block2, block3) => {
-                for block in [block1, block2, block3].into_iter().flatten() {
-                    out.append(&mut get_statement_labels([block.as_ref()]));
-                }
-            }
-            pt::Statement::VariableDefinition(loc, def, _) => {
-                let ty = match &def.ty {
-                    pt::Expression::Type(_, ty) => Some(ty.clone()),
-                    _ => None,
-                };
-                out.push(Label {
-                    name: def.name.name.to_string(),
-                    storage: def.storage.clone(),
-                    ty,
-                    loc: *loc,
-                    stack_offset: 0,
-                });
-            }
-            pt::Statement::Expression(loc, pt::Expression::Assign(_, left, _)) => {
-                match left.as_ref() {
-                    pt::Expression::Variable(ident) => out.push(Label {
-                        name: ident.name.to_string(),
-                        storage: None,
-                        ty: None,
-                        loc: *loc,
-                        stack_offset: 0,
-                    }),
-                    pt::Expression::List(_, list) => {
-                        let list_end = list.len() - 1;
-                        for (idx, (_, param)) in list.iter().enumerate() {
-                            if let Some(param) = param {
-                                if let Some(ref name) = param.name {
-                                    let ty = match &param.ty {
-                                        pt::Expression::Type(_, ty) => Some(ty.clone()),
-                                        _ => None,
-                                    };
-                                    out.push(Label {
-                                        name: name.to_string(),
-                                        storage: param.storage.clone(),
-                                        ty,
-                                        loc: *loc,
-                                        stack_offset: list_end - idx,
-                                    });
-                                }
-                            }
-                        }
+                pt::Type::Bool => Type::Builtin(ParamType::Bytes),
+                pt::Type::String => Type::Builtin(ParamType::String),
+                pt::Type::Int(size) => Type::Builtin(ParamType::Int(*size as usize)),
+                pt::Type::Uint(size) => Type::Builtin(ParamType::Uint(*size as usize)),
+                pt::Type::Bytes(size) => Type::Builtin(ParamType::FixedBytes(*size as usize)),
+                pt::Type::DynamicBytes => Type::Builtin(ParamType::Bytes),
+                pt::Type::Mapping(_, left, right) => Self::Map(
+                    Box::new(Type::from_expression(left)?),
+                    Box::new(Type::from_expression(right)?),
+                ),
+                pt::Type::Function { .. } => Type::Custom(vec!["[Function]".to_string()]),
+                pt::Type::Rational => Type::Custom(vec!["[Rational]".to_string()]),
+            },
+            pt::Expression::Variable(ident) => Type::Custom(vec![ident.name.clone()]),
+            pt::Expression::ArraySubscript(_, expr, num) => {
+                let num = num.as_ref().and_then(|num| {
+                    if let pt::Expression::NumberLiteral(_, num, exp) = num.as_ref() {
+                        let num = if num.is_empty() {
+                            0usize
+                        } else {
+                            num.parse().ok()?
+                        };
+                        let exp = if exp.is_empty() {
+                            0u32
+                        } else {
+                            exp.parse().ok()?
+                        };
+                        Some(num * 10usize.pow(exp))
+                    } else {
+                        None
                     }
-                    _ => {}
+                });
+                let ty = Type::from_expression(expr)?;
+                if let Some(num) = num {
+                    Self::FixedArray(Box::new(ty), num)
+                } else {
+                    Self::Array(Box::new(ty))
                 }
             }
-            _ => {}
+            pt::Expression::MemberAccess(_, expr, ident) => {
+                let mut out = vec![ident.name.clone()];
+                let mut cur_expr = expr;
+                while let pt::Expression::MemberAccess(_, expr, ident) = cur_expr.as_ref() {
+                    out.insert(0, ident.name.clone());
+                    cur_expr = expr;
+                }
+                if let pt::Expression::Variable(ident) = cur_expr.as_ref() {
+                    out.insert(0, ident.name.clone());
+                }
+                Type::Custom(out)
+            }
+            _ => return None,
+        })
+    }
+
+    fn as_ethabi(&self) -> Option<ParamType> {
+        match self {
+            Self::Builtin(param) => Some(param.clone()),
+            Self::Array(inner) => inner
+                .as_ethabi()
+                .map(|inner| ParamType::Array(Box::new(inner))),
+            Self::FixedArray(inner, size) => inner
+                .as_ethabi()
+                .map(|inner| ParamType::FixedArray(Box::new(inner), *size)),
+            _ => None,
         }
     }
-    out
 }
 
-fn handle_line(solc: &Solc, source: &mut ConstructedSource, mut buffer: String) {
-    let parsed_fragment = if let Some(parsed) = parse_fragment(solc, &buffer)
+fn get_contract_part_definition(
+    contract_part: &pt::ContractPart,
+) -> Option<(&str, &pt::Expression)> {
+    match contract_part {
+        pt::ContractPart::VariableDefinition(var_def) => Some((&var_def.name.name, &var_def.ty)),
+        _ => None,
+    }
+}
+
+fn get_statement_definitions(
+    statement: &pt::Statement,
+) -> Vec<(&str, &pt::Expression, Option<&StorageLocation>)> {
+    match statement {
+        pt::Statement::VariableDefinition(_, def, _) => {
+            vec![(def.name.name.as_str(), &def.ty, def.storage.as_ref())]
+        }
+        pt::Statement::Expression(_, pt::Expression::Assign(_, left, _)) => {
+            if let pt::Expression::List(_, list) = left.as_ref() {
+                list.iter()
+                    .filter_map(|(_, param)| {
+                        param.as_ref().and_then(|param| {
+                            param
+                                .name
+                                .as_ref()
+                                .map(|name| (name.name.as_str(), &param.ty, None))
+                        })
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
+    }
+}
+
+fn insert_into_source<'a>(
+    source: &ConstructedSource<'a>,
+    mut buffer: String,
+) -> Result<ConstructedSource<'a>, String> {
+    let parsed_fragment = if let Some(parsed) = parse_fragment(source.solc, &buffer)
         .or_else(|| {
             buffer = buffer.trim_end().to_string();
             buffer.push_str(";\n");
-            parse_fragment(solc, &buffer)
+            parse_fragment(source.solc, &buffer)
         })
         .or_else(|| {
             buffer = buffer.trim_end().trim_end_matches(';').to_string();
             buffer.push('\n');
-            parse_fragment(solc, &buffer)
+            parse_fragment(source.solc, &buffer)
         }) {
         parsed
     } else {
-        return println!("Error: Failed to parse: `{}`", buffer.trim());
+        return Err(buffer.trim().to_string());
     };
 
     let mut new_source = source.clone();
@@ -439,56 +489,76 @@ fn handle_line(solc: &Solc, source: &mut ConstructedSource, mut buffer: String) 
             new_source.insert_in_constructor(&buffer);
         }
     };
+    Ok(new_source)
+}
 
-    let contract = match new_source.compile() {
-        Ok(contract) => contract,
-        Err(errors) => {
-            for error in errors {
-                println!("{error}");
-            }
-            return;
-        }
+pub struct Compiled {
+    contract: Contract,
+    source_unit_parts: Vec<pt::SourceUnitPart>,
+    contract_parts: Vec<pt::ContractPart>,
+    statements: Vec<pt::Statement>,
+    variable_definitions: HashMap<String, (pt::Expression, Option<StorageLocation>)>,
+}
+
+fn compile_source<'a>(
+    source: &ConstructedSource<'a>,
+) -> Result<Compiled, Vec<Box<dyn std::fmt::Display>>> {
+    let contract = source.compile()?;
+
+    let (source_unit_parts, contract_parts, statements) = source.parse_and_decompose().unwrap();
+
+    let mut variable_definitions = HashMap::new();
+    for (key, ty) in contract_parts.iter().flat_map(get_contract_part_definition) {
+        variable_definitions.insert(
+            key.to_string(),
+            (ty.clone(), Some(StorageLocation::Memory(ty.loc()))),
+        );
+    }
+    for (key, ty, storage) in statements.iter().flat_map(get_statement_definitions) {
+        variable_definitions.insert(key.to_string(), (ty.clone(), storage.cloned()));
+    }
+
+    Ok(Compiled {
+        contract,
+        source_unit_parts,
+        contract_parts,
+        statements,
+        variable_definitions,
+    })
+}
+
+struct RunResult {
+    database: InMemoryDB,
+    stack: revm::Stack,
+    memory: revm::Memory,
+}
+
+fn run_compiled(compiled: &Compiled) -> Result<RunResult, revm::Return> {
+    let init_bytecode_bytes = compiled.contract.get_init_bytecode_bytes().unwrap();
+
+    let last_statement = compiled.statements.last().unwrap();
+    let last_instruction = {
+        let end_loc = last_statement.loc();
+        let offset = end_loc.start();
+        let length = end_loc.end() - end_loc.start();
+        compiled
+            .contract
+            .get_source_map()
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .zip(InstructionIter::new(&init_bytecode_bytes))
+            .filter(|(s, _)| s.offset == offset && s.length == length)
+            .map(|(_, i)| i.pc)
+            .max()
+            .unwrap_or_default()
     };
 
-    let statements = if let ParseTreeFragment::Function(stmts) = parsed_fragment {
-        let mut statements = new_source.parse_and_decompose().unwrap().2;
-        statements
-            .drain(statements.len() - stmts.len()..)
-            .map(|statement| (statement.loc(), statement))
-            .collect::<HashMap<_, _>>()
-    } else {
-        HashMap::new()
-    };
-
-    dbg!(get_statement_labels(statements.values()));
-
-    let init_bytecode_bytes = contract.get_init_bytecode_bytes().unwrap();
-    let source_map = contract
-        .get_source_map()
-        .unwrap()
-        .unwrap()
-        .into_iter()
-        .zip(InstructionIter::new(&init_bytecode_bytes))
-        .collect::<Vec<_>>();
-
-    let instructions = statements
-        .keys()
-        .map(|loc| {
-            let offset = loc.start();
-            let length = loc.end() - loc.start();
-            let source_map_entries = source_map
-                .iter()
-                .filter(|(s, _)| s.offset == offset && s.length == length)
-                .map(|(_, i)| *i)
-                .collect::<Vec<_>>();
-            (*loc, source_map_entries)
-        })
-        .collect::<HashMap<_, _>>();
-
-    let mut logger = Logger::new(instructions);
+    let mut database = InMemoryDB::default();
+    let mut logger = Logger::new(last_instruction);
 
     let mut evm = revm::new();
-    evm.database(InMemoryDB::default());
+    evm.database(&mut database);
 
     evm.env.tx.caller = "0x1000000000000000000000000000000000000000"
         .parse()
@@ -498,9 +568,161 @@ fn handle_line(solc: &Solc, source: &mut ConstructedSource, mut buffer: String) 
     });
     evm.env.tx.data = init_bytecode_bytes.to_vec().into();
 
-    evm.inspect(&mut logger);
+    let (ret, ..) = evm.inspect(&mut logger);
+
+    if let Some(res) = logger.state {
+        match res.0 {
+            revm::Return::Continue => Ok(RunResult {
+                database,
+                stack: res.1,
+                memory: res.2,
+            }),
+            res => Err(res),
+        }
+    } else {
+        Err(ret)
+    }
+}
+
+fn handle_line(source: &mut ConstructedSource, buffer: String) {
+    let new_source = match insert_into_source(source, buffer) {
+        Ok(new_source) => new_source,
+        Err(buffer) => {
+            return println!("Error: Failed to parse: `{}`", buffer.trim());
+        }
+    };
+    let compiled = match compile_source(&new_source) {
+        Ok(compiled) => compiled,
+        Err(errors) => {
+            for error in errors {
+                println!("{error}");
+            }
+            return;
+        }
+    };
+    if !compiled.statements.is_empty() {
+        if let Err(ret) = run_compiled(&compiled) {
+            println!("Error: Failed to run: {ret:?}");
+            return;
+        };
+    }
 
     *source = new_source;
+}
+
+fn inspect(source: &ConstructedSource, identifier: &str) {
+    let (source_unit_parts, contract_parts, statements) = source.parse_and_decompose().unwrap();
+
+    let mut variable_definitions = HashMap::new();
+    for (key, ty) in contract_parts.iter().flat_map(get_contract_part_definition) {
+        variable_definitions.insert(
+            key.to_string(),
+            (ty.clone(), Some(StorageLocation::Memory(ty.loc()))),
+        );
+    }
+    for (key, ty, storage) in statements.iter().flat_map(get_statement_definitions) {
+        variable_definitions.insert(key.to_string(), (ty.clone(), storage.cloned()));
+    }
+
+    let (ty, _) = if let Some(def) = variable_definitions.get(identifier) {
+        def
+    } else {
+        println!("Error: `{identifier}` could not be found");
+        return;
+    };
+    let ty = if let Some(ty) = Type::from_expression(ty).and_then(|ty| ty.as_ethabi()) {
+        ty
+    } else {
+        println!("Error: Identifer type currently not supported");
+        return;
+    };
+
+    let new_source = if let Ok(new_source) = insert_into_source(
+        source,
+        format!("bytes memory __inspect__ = abi.encode({identifier})"),
+    ) {
+        new_source
+    } else {
+        println!("Error: failed to compile instruction");
+        return;
+    };
+
+    let compiled = match compile_source(&new_source) {
+        Ok(compiled) => compiled,
+        Err(errors) => {
+            for error in errors {
+                println!("{error}");
+            }
+            return;
+        }
+    };
+
+    let res = match run_compiled(&compiled) {
+        Ok(res) => res,
+        Err(ret) => {
+            println!("Error: failed to run instruction: {ret:?}");
+            return;
+        }
+    };
+
+    let memory_offset = if let Some(offset) = res.stack.data().last() {
+        offset.as_usize()
+    } else {
+        println!("Error: No result found");
+        return;
+    };
+    if memory_offset + 32 > res.memory.len() {
+        println!("Error: Memory size insufficient");
+        return;
+    }
+    let data = &res.memory.data()[memory_offset + 32..];
+    let token = match ethabi::decode(&[ty], data) {
+        Ok(mut tokens) => {
+            if let Some(token) = tokens.pop() {
+                token
+            } else {
+                println!("Error: No tokens decoded");
+                return;
+            }
+        }
+        Err(err) => {
+            println!("Error: Could not decode ABI: {err}");
+            return;
+        }
+    };
+
+    match serde_json::to_string_pretty(&token) {
+        Ok(res) => println!("{res}"),
+        Err(err) => println!("Error: Could not serialize token: {err}"),
+    }
+}
+
+fn handle_cmd(source: &mut ConstructedSource, cmd: &str) {
+    let (cmd, params) = cmd.split_once(' ').unwrap_or((cmd, ""));
+    match cmd {
+        "quit" => std::process::exit(0),
+        "print" => println!("{source}"),
+        "clear" => {
+            source.constructor = Default::default();
+            println!("Stack cleared");
+        }
+        "inspect" => {
+            inspect(source, params.trim());
+        }
+        "help" => {
+            println!(
+                r#"
+The following commands are available:
+
+/inspect => inspect a variable by name (e.g. /inspect var)
+/quit    => quit the repl
+/print   => print the compiled source
+/clear   => clear the current stack
+"#
+            );
+        }
+        _ => println!("Error: Command `{cmd}` not found"),
+    }
 }
 
 fn main() {
@@ -517,6 +739,13 @@ fn main() {
             continue;
         }
 
-        handle_line(&solc, &mut source, buffer)
+        if let Some(cmd) = buffer_trimmed.strip_prefix('/') {
+            if !cmd.starts_with(['/', '*']) {
+                handle_cmd(&mut source, cmd.trim());
+                continue;
+            }
+        }
+
+        handle_line(&mut source, buffer)
     }
 }
