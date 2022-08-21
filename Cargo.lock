@@ -1076,7 +1076,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "solang-parser 0.1.17 (registry+https://github.com/rust-lang/crates.io-index)",
+ "solang-parser",
  "svm-rs",
  "thiserror",
  "tiny-keccak",
@@ -2907,19 +2907,6 @@ dependencies = [
 [[package]]
 name = "solang-parser"
 version = "0.1.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fd659de36c2a8ce8cba4627e2304121acbf57d00589779a5ec3ab24569dc684"
-dependencies = [
- "itertools",
- "lalrpop",
- "lalrpop-util",
- "phf",
- "unicode-xid",
-]
-
-[[package]]
-name = "solang-parser"
-version = "0.1.17"
 source = "git+https://github.com/jpopesculian/solang?branch=public-lexer#7bd9663f7406ee07952273ef3db5b8deef57e53e"
 dependencies = [
  "itertools",
@@ -2944,7 +2931,7 @@ dependencies = [
  "semver",
  "serde_json",
  "similar",
- "solang-parser 0.1.17 (git+https://github.com/jpopesculian/solang?branch=public-lexer)",
+ "solang-parser",
 ]
 
 [[package]]
