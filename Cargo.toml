@@ -1,16 +1,18 @@
 [package]
-name = "sol-repl"
+name = "soli"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ansi_term = "0.12.1"
 ethabi = "17.1.0"
 ethers = { git = "https://github.com/gakonst/ethers-rs" }
 ethers-solc = { git = "https://github.com/gakonst/ethers-rs" }
 hex = "0.4.3"
 primitive-types = "0.11.1"
 revm = "1.7.0"
+rustyline = { version = "10.0.0", default-features = false, features = ["custom-bindings"] }
 semver = "1.0.13"
 serde_json = "1.0.83"
 similar = "2.2.0"
-solang-parser = "0.1.17"
+solang-parser = { version = "0.1.17", git = "https://github.com/jpopesculian/solang", branch = "public-lexer" }

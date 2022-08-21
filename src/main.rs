@@ -1,6 +1,6 @@
-use std::{collections::HashMap, fmt::Debug, io::Write, path::PathBuf};
+use std::{collections::HashMap, fmt::Debug, path::PathBuf, sync::atomic};
 
-use ethabi::{ethereum_types::U256, param_type::ParamType};
+use ethabi::param_type::ParamType;
 use ethers::core::types::Bytes;
 use ethers_solc::{
     artifacts::{BytecodeObject, Contract, Source, Sources},
@@ -10,7 +10,7 @@ use revm::{CreateScheme, Database, InMemoryDB, Inspector, OpCode, TransactTo};
 use semver::Version;
 use solang_parser::{
     diagnostics::Diagnostic,
-    pt::{self, CodeLocation, StorageLocation},
+    pt::{self, CodeLocation},
 };
 
 #[derive(Clone, Copy, Ord, PartialOrd, Eq, PartialEq, Hash)]
@@ -21,13 +21,13 @@ struct Instruction {
     pub data_len: u8,
 }
 
-impl<'a> Instruction {
+impl Instruction {
     fn data(&self) -> &[u8] {
         &self.data[..self.data_len as usize]
     }
 }
 
-impl<'a> Debug for Instruction {
+impl Debug for Instruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Instruction")
             .field("pc", &self.pc)
@@ -122,10 +122,19 @@ where
         eval: revm::Return,
     ) -> revm::Return {
         if interp.program_counter() - 1 == self.last_instruction {
-            self.state = Some((eval.clone(), interp.stack.clone(), interp.memory.clone()));
+            self.state = Some((eval, interp.stack.clone(), interp.memory.clone()));
         }
         eval
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Compiled {
+    contract: Contract,
+    _source_unit_parts: Vec<pt::SourceUnitPart>,
+    _contract_parts: Vec<pt::ContractPart>,
+    statements: Vec<pt::Statement>,
+    variable_definitions: HashMap<String, (pt::Expression, Option<pt::StorageLocation>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +145,7 @@ struct ConstructedSource<'a> {
     pre_contract: String,
     pre_constructor: String,
     constructor: String,
+    cached_compiled: Option<Compiled>,
 }
 
 impl<'a> ConstructedSource<'a> {
@@ -148,21 +158,25 @@ impl<'a> ConstructedSource<'a> {
             pre_constructor: Default::default(),
             pre_contract: Default::default(),
             constructor: Default::default(),
+            cached_compiled: None,
         }
     }
 
     fn insert_before_contract(&mut self, content: &str) -> &mut Self {
         self.pre_contract.push_str(content);
+        self.cached_compiled = None;
         self
     }
 
     fn insert_before_constructor(&mut self, content: &str) -> &mut Self {
         self.pre_constructor.push_str(content);
+        self.cached_compiled = None;
         self
     }
 
     fn insert_in_constructor(&mut self, content: &str) -> &mut Self {
         self.constructor.push_str(content);
+        self.cached_compiled = None;
         self
     }
 
@@ -236,7 +250,7 @@ impl<'a> ConstructedSource<'a> {
             .and_then(|parse_tree| self.decompose(parse_tree))
     }
 
-    fn compile(&self) -> Result<Contract, Vec<Box<dyn std::fmt::Display>>> {
+    fn compile_contract(&self) -> Result<Contract, Vec<Box<dyn std::fmt::Display>>> {
         let mut compiled = match self.solc.compile_exact(&self.compiler_input()) {
             Ok(compiled) => compiled,
             Err(err) => return Err(vec![Box::new(err)]),
@@ -256,6 +270,36 @@ impl<'a> ConstructedSource<'a> {
             .unwrap()
             .remove(&self.contract_name)
             .unwrap())
+    }
+
+    fn compile_source(&mut self) -> Result<Compiled, Vec<Box<dyn std::fmt::Display>>> {
+        if let Some(cached) = self.cached_compiled.as_ref() {
+            return Ok(cached.clone());
+        }
+        let contract = self.compile_contract()?;
+
+        let (source_unit_parts, contract_parts, statements) = self.parse_and_decompose().unwrap();
+
+        let mut variable_definitions = HashMap::new();
+        for (key, ty) in contract_parts.iter().flat_map(get_contract_part_definition) {
+            variable_definitions.insert(
+                key.to_string(),
+                (ty.clone(), Some(pt::StorageLocation::Memory(ty.loc()))),
+            );
+        }
+        for (key, ty, storage) in statements.iter().flat_map(get_statement_definitions) {
+            variable_definitions.insert(key.to_string(), (ty.clone(), storage.cloned()));
+        }
+
+        let compiled = Compiled {
+            contract,
+            _source_unit_parts: source_unit_parts,
+            _contract_parts: contract_parts,
+            statements,
+            variable_definitions,
+        };
+        self.cached_compiled = Some(compiled.clone());
+        Ok(compiled)
     }
 }
 
@@ -277,28 +321,6 @@ impl<'a> std::fmt::Display for ConstructedSource<'a> {
         f.write_str("}\n}")?;
         Ok(())
     }
-}
-
-fn parse_identifier(input: &str) -> (&str, &str) {
-    let mut iter = input.char_indices();
-    let mut end = 0;
-    if let Some((idx, ch)) = iter.next() {
-        match ch {
-            'a'..='z' | 'A'..='Z' | '$' | '_' => {
-                end = idx + 1;
-            }
-            _ => return input.split_at(end),
-        }
-    }
-    for (idx, ch) in iter {
-        match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '$' | '_' => {
-                end = idx + 1;
-            }
-            _ => return input.split_at(end),
-        }
-    }
-    input.split_at(end)
 }
 
 #[derive(Debug)]
@@ -432,7 +454,7 @@ fn get_contract_part_definition(
 
 fn get_statement_definitions(
     statement: &pt::Statement,
-) -> Vec<(&str, &pt::Expression, Option<&StorageLocation>)> {
+) -> Vec<(&str, &pt::Expression, Option<&pt::StorageLocation>)> {
     match statement {
         pt::Statement::VariableDefinition(_, def, _) => {
             vec![(def.name.name.as_str(), &def.ty, def.storage.as_ref())]
@@ -492,43 +514,8 @@ fn insert_into_source<'a>(
     Ok(new_source)
 }
 
-pub struct Compiled {
-    contract: Contract,
-    source_unit_parts: Vec<pt::SourceUnitPart>,
-    contract_parts: Vec<pt::ContractPart>,
-    statements: Vec<pt::Statement>,
-    variable_definitions: HashMap<String, (pt::Expression, Option<StorageLocation>)>,
-}
-
-fn compile_source<'a>(
-    source: &ConstructedSource<'a>,
-) -> Result<Compiled, Vec<Box<dyn std::fmt::Display>>> {
-    let contract = source.compile()?;
-
-    let (source_unit_parts, contract_parts, statements) = source.parse_and_decompose().unwrap();
-
-    let mut variable_definitions = HashMap::new();
-    for (key, ty) in contract_parts.iter().flat_map(get_contract_part_definition) {
-        variable_definitions.insert(
-            key.to_string(),
-            (ty.clone(), Some(StorageLocation::Memory(ty.loc()))),
-        );
-    }
-    for (key, ty, storage) in statements.iter().flat_map(get_statement_definitions) {
-        variable_definitions.insert(key.to_string(), (ty.clone(), storage.cloned()));
-    }
-
-    Ok(Compiled {
-        contract,
-        source_unit_parts,
-        contract_parts,
-        statements,
-        variable_definitions,
-    })
-}
-
 struct RunResult {
-    database: InMemoryDB,
+    _database: InMemoryDB,
     stack: revm::Stack,
     memory: revm::Memory,
 }
@@ -573,7 +560,7 @@ fn run_compiled(compiled: &Compiled) -> Result<RunResult, revm::Return> {
     if let Some(res) = logger.state {
         match res.0 {
             revm::Return::Continue => Ok(RunResult {
-                database,
+                _database: database,
                 stack: res.1,
                 memory: res.2,
             }),
@@ -585,13 +572,13 @@ fn run_compiled(compiled: &Compiled) -> Result<RunResult, revm::Return> {
 }
 
 fn handle_line(source: &mut ConstructedSource, buffer: String) {
-    let new_source = match insert_into_source(source, buffer) {
+    let mut new_source = match insert_into_source(source, buffer) {
         Ok(new_source) => new_source,
         Err(buffer) => {
             return println!("Error: Failed to parse: `{}`", buffer.trim());
         }
     };
-    let compiled = match compile_source(&new_source) {
+    let compiled = match new_source.compile_source() {
         Ok(compiled) => compiled,
         Err(errors) => {
             for error in errors {
@@ -610,21 +597,77 @@ fn handle_line(source: &mut ConstructedSource, buffer: String) {
     *source = new_source;
 }
 
-fn inspect(source: &ConstructedSource, identifier: &str) {
-    let (source_unit_parts, contract_parts, statements) = source.parse_and_decompose().unwrap();
-
-    let mut variable_definitions = HashMap::new();
-    for (key, ty) in contract_parts.iter().flat_map(get_contract_part_definition) {
-        variable_definitions.insert(
-            key.to_string(),
-            (ty.clone(), Some(StorageLocation::Memory(ty.loc()))),
-        );
+fn format_ethabi_token(token: &ethabi::Token, indent: usize) -> String {
+    use ethabi::Token::*;
+    match token {
+        Address(address) => format!(
+            "{} {}",
+            Color::Cyan.paint("address"),
+            Color::Red.paint(format!("0x{:x}", address))
+        ),
+        FixedBytes(bytes) | Bytes(bytes) => format!(
+            "{} {}",
+            Color::Cyan.paint("bytes"),
+            Color::Red.paint(format!("0x{}", hex::encode(bytes)))
+        ),
+        Int(num) => format!(
+            "{} {}",
+            Color::Cyan.paint("int"),
+            Color::Red.paint(format!("0x{:x}", num))
+        ),
+        Uint(num) => format!(
+            "{} {}",
+            Color::Cyan.paint("uint"),
+            Color::Red.paint(format!("0x{:x}", num))
+        ),
+        Bool(boolean) => format!(
+            "{} {}",
+            Color::Cyan.paint("bool"),
+            Color::Red.paint(format!("{}", boolean))
+        ),
+        String(string) => format!(
+            "{} {}",
+            Color::Cyan.paint("string"),
+            Color::Green.paint(format!("{:?}", string))
+        ),
+        FixedArray(tokens) | Array(tokens) => {
+            let mut out = format!("{}", Color::Cyan.paint("array"));
+            out.push_str(" [\n");
+            for token in tokens {
+                out.push_str(&"  ".repeat(indent + 1));
+                out.push_str(&format_ethabi_token(token, indent + 1));
+                out.push_str(",\n");
+            }
+            out.push_str(&"  ".repeat(indent));
+            out.push(']');
+            out
+        }
+        Tuple(tokens) => {
+            let mut out = format!("{}", Color::Cyan.paint("tuple"));
+            out.push_str(" (\n");
+            for token in tokens {
+                out.push_str(&"  ".repeat(indent + 1));
+                out.push_str(&format_ethabi_token(token, indent + 1));
+                out.push_str(",\n");
+            }
+            out.push_str(&"  ".repeat(indent));
+            out.push(')');
+            out
+        }
     }
-    for (key, ty, storage) in statements.iter().flat_map(get_statement_definitions) {
-        variable_definitions.insert(key.to_string(), (ty.clone(), storage.cloned()));
-    }
+}
 
-    let (ty, _) = if let Some(def) = variable_definitions.get(identifier) {
+fn inspect(source: &mut ConstructedSource, identifier: &str) {
+    let compiled = match source.compile_source() {
+        Ok(compiled) => compiled,
+        Err(errors) => {
+            for error in errors {
+                println!("{error}");
+            }
+            return;
+        }
+    };
+    let (ty, _) = if let Some(def) = compiled.variable_definitions.get(identifier) {
         def
     } else {
         println!("Error: `{identifier}` could not be found");
@@ -637,7 +680,7 @@ fn inspect(source: &ConstructedSource, identifier: &str) {
         return;
     };
 
-    let new_source = if let Ok(new_source) = insert_into_source(
+    let mut new_source = if let Ok(new_source) = insert_into_source(
         source,
         format!("bytes memory __inspect__ = abi.encode({identifier})"),
     ) {
@@ -647,7 +690,7 @@ fn inspect(source: &ConstructedSource, identifier: &str) {
         return;
     };
 
-    let compiled = match compile_source(&new_source) {
+    let compiled = match new_source.compile_source() {
         Ok(compiled) => compiled,
         Err(errors) => {
             for error in errors {
@@ -691,23 +734,31 @@ fn inspect(source: &ConstructedSource, identifier: &str) {
         }
     };
 
-    match serde_json::to_string_pretty(&token) {
-        Ok(res) => println!("{res}"),
-        Err(err) => println!("Error: Could not serialize token: {err}"),
-    }
+    println!("{}", format_ethabi_token(&token, 0));
 }
 
-fn handle_cmd(source: &mut ConstructedSource, cmd: &str) {
-    let (cmd, params) = cmd.split_once(' ').unwrap_or((cmd, ""));
+fn handle_cmd<'a>(
+    source: &mut ConstructedSource,
+    cmd: &str,
+    mut args: impl Iterator<Item = &'a str>,
+) {
     match cmd {
-        "quit" => std::process::exit(0),
-        "print" => println!("{source}"),
+        "exit" => {
+            println!();
+            std::process::exit(0);
+        }
+        "print" => println!("{}", SolidityHelper::highlight(&source.to_string())),
         "clear" => {
             source.constructor = Default::default();
+            source.cached_compiled = None;
             println!("Stack cleared");
         }
         "inspect" => {
-            inspect(source, params.trim());
+            if let Some(ident) = args.next() {
+                inspect(source, ident);
+            } else {
+                println!(r#"Expected identifier as argument. See "/help" for details"#);
+            }
         }
         "help" => {
             println!(
@@ -715,8 +766,8 @@ fn handle_cmd(source: &mut ConstructedSource, cmd: &str) {
 The following commands are available:
 
 /inspect => inspect a variable by name (e.g. /inspect var)
-/quit    => quit the repl
-/print   => print the compiled source
+/exit    => exit the repl
+/print   => print the constructed source
 /clear   => clear the current stack
 "#
             );
@@ -725,27 +776,393 @@ The following commands are available:
     }
 }
 
-fn main() {
-    let solc = Solc::default();
-    println!("solc {}", solc.version().unwrap());
-    let mut source = ConstructedSource::new(&solc);
-    loop {
-        std::io::stdout().write_all(b">>> ").unwrap();
-        std::io::stdout().flush().unwrap();
-        let mut buffer = String::new();
-        std::io::stdin().read_line(&mut buffer).unwrap();
-        let buffer_trimmed = buffer.trim();
-        if buffer_trimmed.is_empty() || buffer_trimmed.trim_end_matches(';').is_empty() {
-            continue;
-        }
+use ansi_term::{Color, Style};
+use rustyline::{
+    completion::Completer,
+    error::ReadlineError,
+    highlight::Highlighter,
+    hint::Hinter,
+    validate::{ValidationContext, ValidationResult, Validator},
+    Cmd, ConditionalEventHandler, Editor, Event, EventContext, EventHandler, Helper, KeyCode,
+    KeyEvent, Modifiers, RepeatCount,
+};
+use solang_parser::lexer::{Lexer, LexicalError, Token};
 
-        if let Some(cmd) = buffer_trimmed.strip_prefix('/') {
+struct CtrlCHandler {
+    loaded: atomic::AtomicBool,
+}
+
+impl CtrlCHandler {
+    fn bind_to<H: Helper>(editor: &mut Editor<H>) {
+        editor.bind_sequence(
+            Event::Any,
+            EventHandler::Conditional(Box::new(Self {
+                loaded: false.into(),
+            })),
+        );
+    }
+}
+
+impl ConditionalEventHandler for CtrlCHandler {
+    fn handle(
+        &self,
+        evt: &Event,
+        _n: RepeatCount,
+        _positive: bool,
+        _ctx: &EventContext,
+    ) -> Option<Cmd> {
+        if let Some(KeyEvent(KeyCode::Char('C'), Modifiers::CTRL)) = evt.get(0) {
+            let loaded = self.loaded.swap(true, atomic::Ordering::Relaxed);
+            if loaded {
+                return Some(Cmd::EndOfFile);
+            }
+        } else {
+            self.loaded.store(false, atomic::Ordering::Relaxed);
+        }
+        None
+    }
+}
+
+struct CmdLexer<'a> {
+    input: &'a str,
+    index: usize,
+    last_token: Option<CmdToken<'a>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CmdToken<'a> {
+    Cmd(&'a str),
+    Arg(&'a str),
+}
+
+impl<'a> CmdToken<'a> {
+    fn as_str(&self) -> &'a str {
+        match self {
+            Self::Cmd(s) => s,
+            Self::Arg(s) => s,
+        }
+    }
+}
+
+impl<'a> CmdLexer<'a> {
+    fn new(input: &'a str) -> Self {
+        let input_len = input.len();
+        let index = if let Some(cmd) = input.trim_start().strip_prefix('/') {
             if !cmd.starts_with(['/', '*']) {
-                handle_cmd(&mut source, cmd.trim());
-                continue;
+                input_len - cmd.len()
+            } else {
+                input_len
+            }
+        } else {
+            input_len
+        };
+        Self {
+            input,
+            index,
+            last_token: None,
+        }
+    }
+
+    fn rest(&self) -> &str {
+        &self.input[self.index..]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rest().is_empty()
+    }
+
+    fn is_command(input: &str) -> bool {
+        !CmdLexer::new(input).is_empty()
+    }
+}
+
+impl<'a> Iterator for CmdLexer<'a> {
+    type Item = (usize, CmdToken<'a>, usize);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_empty() {
+            return None;
+        }
+        let start = self.index;
+        let mut iter = self.rest().char_indices();
+        let end = iter
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(idx, _)| idx + start)
+            .unwrap_or_else(|| self.input.len());
+        self.index = iter
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map(|(idx, _)| idx + start)
+            .unwrap_or_else(|| self.input.len());
+        let token = &self.input[start..end];
+        let token = if self.last_token.is_some() {
+            CmdToken::Arg(token)
+        } else {
+            CmdToken::Cmd(token)
+        };
+        self.last_token = Some(token);
+        Some((start, token, end))
+    }
+}
+
+pub trait TokenStyle {
+    fn style(&self) -> Style;
+}
+
+impl<'a> TokenStyle for CmdToken<'a> {
+    fn style(&self) -> Style {
+        use CmdToken::*;
+        match self {
+            Cmd(_) => Color::Purple.into(),
+            Arg(_) => Color::Blue.into(),
+        }
+    }
+}
+
+impl<'a> TokenStyle for Token<'a> {
+    fn style(&self) -> Style {
+        use Token::*;
+        match self {
+            StringLiteral(_, _) => Color::Green.into(),
+            AddressLiteral(_)
+            | HexLiteral(_)
+            | Number(_, _)
+            | RationalNumber(_, _, _)
+            | HexNumber(_)
+            | True
+            | False
+            | Seconds
+            | Minutes
+            | Hours
+            | Days
+            | Weeks
+            | Gwei
+            | Wei
+            | Ether
+            | This => Color::Red.into(),
+            Memory | Storage | Calldata | Public | Private | Internal | External | Constant
+            | Pure | View | Payable | Anonymous | Indexed | Abstract | Virtual | Override
+            | Modifier | Immutable | Unchecked => Color::Blue.into(),
+            Contract | Library | Interface | Function | Pragma | Import | Struct | Event
+            | Error | Enum | Type | Constructor | As | Is | Using => Color::Yellow.into(),
+            New | Delete | Do | Continue | Break | Throw | Emit | Return | Returns | Revert
+            | For | While | If | Else | Try | Catch | Assembly | Let | Leave | Switch | Case
+            | Default | YulArrow | Arrow => Color::Purple.into(),
+            Uint(_) | Int(_) | Bytes(_) | Byte | DynamicBytes | Bool | Address | String
+            | Mapping => Color::Cyan.into(),
+            Identifier(_) => Style::new(),
+            _ => Style::new(),
+        }
+    }
+}
+
+struct SolidityHelper;
+
+impl SolidityHelper {
+    fn validate_closed(input: &str) -> ValidationResult {
+        if CmdLexer::is_command(input) {
+            return ValidationResult::Valid(None);
+        }
+        let mut bracket_depth = 0usize;
+        let mut paren_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let mut comments = Vec::new();
+        for res in Lexer::new(input, 0, &mut comments) {
+            match res {
+                Err(err) => match err {
+                    LexicalError::EndOfFileInComment(_)
+                    | LexicalError::EndofFileInHex(_)
+                    | LexicalError::EndOfFileInString(_) => return ValidationResult::Incomplete,
+                    _ => return ValidationResult::Valid(None),
+                },
+                Ok((_, token, _)) => match token {
+                    Token::OpenBracket => {
+                        bracket_depth = bracket_depth.saturating_add(1);
+                    }
+                    Token::OpenCurlyBrace => {
+                        brace_depth = brace_depth.saturating_add(1);
+                    }
+                    Token::OpenParenthesis => {
+                        paren_depth = paren_depth.saturating_add(1);
+                    }
+                    Token::CloseBracket => {
+                        bracket_depth = bracket_depth.saturating_sub(1);
+                    }
+                    Token::CloseCurlyBrace => {
+                        brace_depth = brace_depth.saturating_sub(1);
+                    }
+                    Token::CloseParenthesis => {
+                        paren_depth = paren_depth.saturating_sub(1);
+                    }
+                    _ => {}
+                },
             }
         }
+        if (bracket_depth | brace_depth | paren_depth) == 0 {
+            ValidationResult::Valid(None)
+        } else {
+            ValidationResult::Incomplete
+        }
+    }
 
-        handle_line(&mut source, buffer)
+    fn get_styles(input: &str) -> Vec<(usize, Style, usize)> {
+        let cmd_lexer = CmdLexer::new(input);
+        if !cmd_lexer.is_empty() {
+            cmd_lexer
+                .map(|(start, token, end)| (start, token.style(), end))
+                .collect()
+        } else {
+            let mut comments = Vec::new();
+            let mut out = Lexer::new(input, 0, &mut comments)
+                .flatten()
+                .map(|(start, token, end)| (start, token.style(), end))
+                .collect::<Vec<_>>();
+            for comment in comments {
+                let loc = match comment {
+                    pt::Comment::Line(loc, _) => loc,
+                    pt::Comment::Block(loc, _) => loc,
+                    pt::Comment::DocLine(loc, _) => loc,
+                    pt::Comment::DocBlock(loc, _) => loc,
+                };
+                out.push((loc.start(), Style::new().dimmed(), loc.end()))
+            }
+            out
+        }
+    }
+
+    fn get_contiguous_styles(input: &str) -> Vec<(usize, Style, usize)> {
+        let mut styles = Self::get_styles(input);
+        styles.sort_by_key(|(start, _, _)| *start);
+        let mut out = vec![];
+        let mut index = 0;
+        for (start, style, end) in styles {
+            if index < start {
+                out.push((index, Style::new(), start));
+            }
+            out.push((start, style, end));
+            index = end;
+        }
+        if index < input.len() {
+            out.push((index, Style::new(), input.len()));
+        }
+        out
+    }
+
+    fn highlight(input: &str) -> String {
+        let mut out = String::new();
+        for (start, style, end) in Self::get_contiguous_styles(input) {
+            out.push_str(&format!("{}", style.paint(&input[start..end])))
+        }
+        out
+    }
+}
+
+impl Validator for SolidityHelper {
+    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+        Ok(Self::validate_closed(ctx.input()))
+    }
+}
+
+impl Highlighter for SolidityHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+        std::borrow::Cow::Owned(Self::highlight(line))
+    }
+    fn highlight_char(&self, line: &str, pos: usize) -> bool {
+        pos == line.len()
+    }
+}
+
+impl Completer for SolidityHelper {
+    type Candidate = String;
+}
+
+impl Hinter for SolidityHelper {
+    type Hint = String;
+}
+
+impl Helper for SolidityHelper {}
+
+pub struct Console {
+    editor: Editor<SolidityHelper>,
+}
+
+impl Console {
+    pub fn new() -> rustyline::Result<Self> {
+        let mut editor = Editor::new()?;
+        CtrlCHandler::bind_to(&mut editor);
+        editor.set_helper(Some(SolidityHelper));
+        Ok(Console { editor })
+    }
+
+    pub fn readline(&mut self) -> rustyline::Result<String> {
+        loop {
+            let line = self.editor.readline("> ");
+            match line {
+                Ok(line) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    self.editor.history_mut().add(&line);
+                    return Ok(line);
+                }
+                Err(err) => match err {
+                    ReadlineError::Interrupted => {
+                        println!(
+                            "{}",
+                            Style::new().dimmed().paint(
+                                r#"(To exit, press Ctrl+C again or Ctrl+D or type "/exit")"#
+                            )
+                        );
+                    }
+                    err => return Err(err),
+                },
+            }
+        }
+    }
+}
+
+fn main() -> rustyline::Result<()> {
+    let solc = Solc::default();
+    println!("solc {}", solc.version().expect("Solc version unavailable"));
+    println!(r#"Type "/help" for more information"#);
+
+    let mut source = ConstructedSource::new(&solc);
+    let mut console = Console::new()?;
+    loop {
+        match console.readline() {
+            Ok(mut line) => {
+                let mut cmd_lexer = CmdLexer::new(&line);
+                if !cmd_lexer.is_empty() {
+                    let cmd = cmd_lexer.next().unwrap().1.as_str();
+                    let args = cmd_lexer.map(|(_, arg, _)| arg.as_str());
+                    handle_cmd(&mut source, cmd, args);
+                } else {
+                    let compiled = match source.compile_source() {
+                        Ok(compiled) => compiled,
+                        Err(errors) => {
+                            for error in errors {
+                                println!("{error}");
+                            }
+                            continue;
+                        }
+                    };
+                    if compiled.variable_definitions.contains_key(&line) {
+                        handle_cmd(&mut source, "inspect", [line.as_str()].into_iter())
+                    } else {
+                        if !line.ends_with('\n') {
+                            line.push('\n');
+                        }
+                        handle_line(&mut source, line)
+                    }
+                }
+            }
+            Err(err) => match err {
+                ReadlineError::Eof => {
+                    std::process::exit(0);
+                }
+                err => {
+                    println!("{err}");
+                    std::process::exit(1);
+                }
+            },
+        };
     }
 }
