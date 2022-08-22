@@ -20,7 +20,7 @@ rustyline = { version = "10.0.0", default-features = false, features = ["custom-
 semver = "1.0.13"
 serde_json = "1.0.83"
 similar = "2.2.0"
-solang-parser = "0.1.17"
+solang-parser = "=0.1.17"
 
 [patch.crates-io]
-solang-parser = { version = "0.1.17", git = "https://github.com/jpopesculian/solang", branch = "public-lexer" }
+solang-parser = { git = "https://github.com/hyperledger-labs/solang" }

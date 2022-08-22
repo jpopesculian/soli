@@ -895,7 +895,7 @@ dependencies = [
 [[package]]
 name = "ethers"
 version = "0.17.0"
-source = "git+https://github.com/gakonst/ethers-rs#49b4ac7acbbd71b4d10f7780c8d2efe9af27799b"
+source = "git+https://github.com/gakonst/ethers-rs#71b4893a3dd174025548748592dd7357296f1587"
 dependencies = [
  "ethers-addressbook",
  "ethers-contract",
@@ -909,7 +909,7 @@ dependencies = [
 [[package]]
 name = "ethers-addressbook"
 version = "0.17.0"
-source = "git+https://github.com/gakonst/ethers-rs#49b4ac7acbbd71b4d10f7780c8d2efe9af27799b"
+source = "git+https://github.com/gakonst/ethers-rs#71b4893a3dd174025548748592dd7357296f1587"
 dependencies = [
  "ethers-core",
  "once_cell",
@@ -920,7 +920,7 @@ dependencies = [
 [[package]]
 name = "ethers-contract"
 version = "0.17.0"
-source = "git+https://github.com/gakonst/ethers-rs#49b4ac7acbbd71b4d10f7780c8d2efe9af27799b"
+source = "git+https://github.com/gakonst/ethers-rs#71b4893a3dd174025548748592dd7357296f1587"
 dependencies = [
  "ethers-core",
  "ethers-providers",
@@ -936,7 +936,7 @@ dependencies = [
 [[package]]
 name = "ethers-core"
 version = "0.17.0"
-source = "git+https://github.com/gakonst/ethers-rs#49b4ac7acbbd71b4d10f7780c8d2efe9af27799b"
+source = "git+https://github.com/gakonst/ethers-rs#71b4893a3dd174025548748592dd7357296f1587"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -965,7 +965,7 @@ dependencies = [
 [[package]]
 name = "ethers-etherscan"
 version = "0.17.0"
-source = "git+https://github.com/gakonst/ethers-rs#49b4ac7acbbd71b4d10f7780c8d2efe9af27799b"
+source = "git+https://github.com/gakonst/ethers-rs#71b4893a3dd174025548748592dd7357296f1587"
 dependencies = [
  "ethers-core",
  "getrandom",
@@ -981,7 +981,7 @@ dependencies = [
 [[package]]
 name = "ethers-middleware"
 version = "0.17.0"
-source = "git+https://github.com/gakonst/ethers-rs#49b4ac7acbbd71b4d10f7780c8d2efe9af27799b"
+source = "git+https://github.com/gakonst/ethers-rs#71b4893a3dd174025548748592dd7357296f1587"
 dependencies = [
  "async-trait",
  "auto_impl 0.5.0",
@@ -1006,7 +1006,7 @@ dependencies = [
 [[package]]
 name = "ethers-providers"
 version = "0.17.0"
-source = "git+https://github.com/gakonst/ethers-rs#49b4ac7acbbd71b4d10f7780c8d2efe9af27799b"
+source = "git+https://github.com/gakonst/ethers-rs#71b4893a3dd174025548748592dd7357296f1587"
 dependencies = [
  "async-trait",
  "auto_impl 1.0.1",
@@ -1040,7 +1040,7 @@ dependencies = [
 [[package]]
 name = "ethers-signers"
 version = "0.17.0"
-source = "git+https://github.com/gakonst/ethers-rs#49b4ac7acbbd71b4d10f7780c8d2efe9af27799b"
+source = "git+https://github.com/gakonst/ethers-rs#71b4893a3dd174025548748592dd7357296f1587"
 dependencies = [
  "async-trait",
  "coins-bip32",
@@ -1057,7 +1057,7 @@ dependencies = [
 [[package]]
 name = "ethers-solc"
 version = "0.17.0"
-source = "git+https://github.com/gakonst/ethers-rs#49b4ac7acbbd71b4d10f7780c8d2efe9af27799b"
+source = "git+https://github.com/gakonst/ethers-rs#71b4893a3dd174025548748592dd7357296f1587"
 dependencies = [
  "cfg-if",
  "colored",
@@ -2770,9 +2770,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.83"
+version = "1.0.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38dd04e3c8279e75b31ef29dbdceebfe5ad89f4d0937213c53f7d49d01b3d5a7"
+checksum = "e55a28e3aaef9d5ce0506d0a14dbba8054ddc7e499ef522dd8b26859ec9d4a44"
 dependencies = [
  "itoa",
  "ryu",
@@ -2907,7 +2907,7 @@ dependencies = [
 [[package]]
 name = "solang-parser"
 version = "0.1.17"
-source = "git+https://github.com/jpopesculian/solang?branch=public-lexer#7bd9663f7406ee07952273ef3db5b8deef57e53e"
+source = "git+https://github.com/hyperledger-labs/solang#143c34439951e38f9bdbc8808fb540d21b78118c"
 dependencies = [
  "itertools",
  "lalrpop",
