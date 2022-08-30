@@ -11,7 +11,7 @@ Installation requires Rust. You can install the Rust toolchain with
 ```bash
 git clone https://github.com/jpopesculian/soli.git
 cd soli
-cargo install --path .
+cargo install --locked --path .
 ```
 
 ## Usage

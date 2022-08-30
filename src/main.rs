@@ -26,7 +26,7 @@
 use std::{collections::HashMap, fmt::Debug, path::PathBuf, sync::atomic};
 
 use ethabi::param_type::ParamType;
-use ethers::core::types::Bytes;
+use ethers_core::types::Bytes;
 use ethers_solc::{
     artifacts::{BytecodeObject, Contract, Source, Sources},
     Artifact, CompilerInput, Solc,
